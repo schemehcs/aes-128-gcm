@@ -1,54 +1,82 @@
 use aes_128::{AES128, Key};
 use subtle::ConstantTimeEq;
+
+/// Maximum number of 128-bit blocks: 2^32 - 1 per GCM specification
 const MAX_BLOCKS: usize = (1 << 32) - 1;
+
+/// Encrypts plaintext using AES-128-GCM mode with associated authenticated data (AAD).
+///
+/// Returns a tuple of (ciphertext, authentication_tag).
+/// The authentication tag is always 16 bytes (128 bits).
 pub fn encrypt(aad: &[u8], plaintext: &[u8], key: &Key, nonce: &[u8]) -> (Vec<u8>, [u8; 16]) {
-    assert!(plaintext.len() <= MAX_BLOCKS * 16, "plaintext exceeds GCM limit");
+    assert!(
+        plaintext.len() <= MAX_BLOCKS * 16,
+        "plaintext exceeds GCM limit"
+    );
     assert!(!nonce.is_empty(), "nonce must not be empty");
+
     let mut ciphertext = Vec::with_capacity(plaintext.len());
     let ciph = AES128::new(key);
+
+    // H is the GHASH subkey: E(K, 0^128)
     let h = u128::from_be_bytes(ciph.encrypt(&[0; 16]));
-    let y0_be = if nonce.len() == 12 {
-        let mut t = [0u8; 16];
-        t[..12].copy_from_slice(nonce);
-        t[15] = 1;
-        t
-    } else {
-        ghash_streaming(h, &[], nonce).to_be_bytes()
-    };
+
+    // Derive initial counter block Y_0 from nonce
+    let y0_be = derive_y0(h, nonce);
+
+    // Process plaintext blocks in CTR mode starting from Y_0 + 1
     let mut y_be = y0_be;
     incr_be(&mut y_be);
+
     let mut chunks = plaintext.chunks_exact(16);
-    for chunk_n in chunks
-        .by_ref()
-        .map(|c| u128::from_be_bytes(c.try_into().unwrap()))
-    {
-        let stream = ciph.encrypt(&y_be);
-        let stream_n = u128::from_be_bytes(stream);
-        let cipher = stream_n ^ chunk_n;
-        ciphertext.extend_from_slice(&cipher.to_be_bytes());
+    for chunk in chunks.by_ref() {
+        let plaintext_block = u128::from_be_bytes(chunk.try_into().unwrap());
+        let stream_block = u128::from_be_bytes(ciph.encrypt(&y_be));
+        let cipher_block = stream_block ^ plaintext_block;
+        ciphertext.extend_from_slice(&cipher_block.to_be_bytes());
         incr_be(&mut y_be);
     }
+
+    // Handle final partial block
     let remainder = chunks.remainder();
     if !remainder.is_empty() {
-        let stream = ciph.encrypt(&y_be);
-        let stream_n = u128::from_be_bytes(stream);
-        let mut block: [u8; 16] = [0; 16];
-        block[..remainder.len()].copy_from_slice(remainder);
-        let block_n = u128::from_be_bytes(block);
-        let cipher = stream_n ^ block_n;
-        ciphertext.extend_from_slice(&cipher.to_be_bytes()[..remainder.len()]);
+        let stream_block = u128::from_be_bytes(ciph.encrypt(&y_be));
+        let mut padded_plaintext = [0u8; 16];
+        padded_plaintext[..remainder.len()].copy_from_slice(remainder);
+        let plaintext_block = u128::from_be_bytes(padded_plaintext);
+        let cipher_block = stream_block ^ plaintext_block;
+        ciphertext.extend_from_slice(&cipher_block.to_be_bytes()[..remainder.len()]);
     }
+
+    // Compute authentication tag: GHASH(H, A, C) XOR E(K, Y_0)
     let tag_ghash = ghash_streaming(h, aad, &ciphertext);
     let e0 = ciph.encrypt(&y0_be);
-    let e0_n = u128::from_be_bytes(e0);
-    let tag_n = tag_ghash ^ e0_n;
-    (ciphertext, tag_n.to_be_bytes())
+    let e0_int = u128::from_be_bytes(e0);
+    let tag = (tag_ghash ^ e0_int).to_be_bytes();
+
+    (ciphertext, tag)
 }
 
+/// Increments the 32-bit big-endian counter in the lower 4 bytes of a 128-bit block.
+/// Used for GCM counter mode where bytes 0-11 contain the nonce and bytes 12-15 contain the counter.
 fn incr_be(y: &mut [u8; 16]) {
     let mut ctr: u32 = u32::from_be_bytes(y[12..].try_into().unwrap());
     ctr = ctr.wrapping_add(1);
     y[12..].copy_from_slice(&ctr.to_be_bytes());
+}
+
+/// Derives the initial counter block Y_0 from the nonce.
+/// If nonce is 12 bytes (standard), Y_0 = nonce || 0x00000001.
+/// Otherwise, Y_0 = GHASH(H, empty, nonce).
+fn derive_y0(h: u128, nonce: &[u8]) -> [u8; 16] {
+    if nonce.len() == 12 {
+        let mut y0 = [0u8; 16];
+        y0[..12].copy_from_slice(nonce);
+        y0[15] = 1;
+        y0
+    } else {
+        ghash_streaming(h, &[], nonce).to_be_bytes()
+    }
 }
 
 #[derive(Debug, PartialEq)]
