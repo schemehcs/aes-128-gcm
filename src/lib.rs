@@ -1,7 +1,9 @@
 use aes_128::{AES128, Key};
 use subtle::ConstantTimeEq;
-
+const MAX_BLOCKS: usize = (1 << 32) - 1;
 pub fn encrypt(aad: &[u8], plaintext: &[u8], key: &Key, nonce: &[u8]) -> (Vec<u8>, [u8; 16]) {
+    assert!(plaintext.len() <= MAX_BLOCKS * 16, "plaintext exceeds GCM limit");
+    assert!(!nonce.is_empty(), "nonce must not be empty");
     let mut ciphertext = Vec::with_capacity(plaintext.len());
     let ciph = AES128::new(key);
     let h = u128::from_be_bytes(ciph.encrypt(&[0; 16]));
@@ -66,6 +68,8 @@ pub fn decrypt(
     key: &Key,
     nonce: &[u8],
 ) -> Result<Vec<u8>, DecryptErr> {
+    assert!(ciphertext.len() <= MAX_BLOCKS * 16, "ciphertext exceeds GCM limit");
+    assert!(!nonce.is_empty(), "nonce must not be empty");
     let ciph = AES128::new(key);
     let h = u128::from_be_bytes(ciph.encrypt(&[0; 16]));
     let y0_be = if nonce.len() == 12 {
