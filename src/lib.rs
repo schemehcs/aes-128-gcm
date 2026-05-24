@@ -8,12 +8,18 @@ const MAX_BLOCKS: usize = (1 << 32) - 1;
 ///
 /// Returns a tuple of (ciphertext, authentication_tag).
 /// The authentication tag is always 16 bytes (128 bits).
-pub fn encrypt(aad: &[u8], plaintext: &[u8], key: &Key, nonce: &[u8]) -> (Vec<u8>, [u8; 16]) {
-    assert!(
-        plaintext.len() <= MAX_BLOCKS * 16,
-        "plaintext exceeds GCM limit"
-    );
-    assert!(!nonce.is_empty(), "nonce must not be empty");
+pub fn encrypt(
+    aad: &[u8],
+    plaintext: &[u8],
+    key: &Key,
+    nonce: &[u8],
+) -> Result<(Vec<u8>, [u8; 16]), CryptErr> {
+    if plaintext.len() > MAX_BLOCKS * 16 {
+        return Err(CryptErr);
+    }
+    if nonce.is_empty() {
+        return Err(CryptErr);
+    }
 
     let mut ciphertext = Vec::with_capacity(plaintext.len());
     let ciph = AES128::new(key);
@@ -54,7 +60,7 @@ pub fn encrypt(aad: &[u8], plaintext: &[u8], key: &Key, nonce: &[u8]) -> (Vec<u8
     let e0_int = u128::from_be_bytes(e0);
     let tag = (tag_ghash ^ e0_int).to_be_bytes();
 
-    (ciphertext, tag)
+    Ok((ciphertext, tag))
 }
 
 /// Increments the 32-bit big-endian counter in the lower 4 bytes of a 128-bit block.
@@ -80,14 +86,14 @@ fn derive_y0(h: u128, nonce: &[u8]) -> [u8; 16] {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct DecryptErr;
+pub struct CryptErr;
 
-impl std::fmt::Display for DecryptErr {
+impl std::fmt::Display for CryptErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Failed to decrypt")
+        write!(f, "Failed to crypt")
     }
 }
-impl std::error::Error for DecryptErr {}
+impl std::error::Error for CryptErr {}
 
 pub fn decrypt(
     aad: &[u8],
@@ -95,19 +101,15 @@ pub fn decrypt(
     tag: &[u8; 16],
     key: &Key,
     nonce: &[u8],
-) -> Result<Vec<u8>, DecryptErr> {
-    assert!(ciphertext.len() <= MAX_BLOCKS * 16, "ciphertext exceeds GCM limit");
+) -> Result<Vec<u8>, CryptErr> {
+    assert!(
+        ciphertext.len() <= MAX_BLOCKS * 16,
+        "ciphertext exceeds GCM limit"
+    );
     assert!(!nonce.is_empty(), "nonce must not be empty");
     let ciph = AES128::new(key);
     let h = u128::from_be_bytes(ciph.encrypt(&[0; 16]));
-    let y0_be = if nonce.len() == 12 {
-        let mut t = [0u8; 16];
-        t[..12].copy_from_slice(nonce);
-        t[15] = 1;
-        t
-    } else {
-        ghash_streaming(h, &[], nonce).to_be_bytes()
-    };
+    let y0_be = derive_y0(h, nonce);
     let e0 = ciph.encrypt(&y0_be);
     let ghash = ghash_streaming(h, aad, ciphertext);
     let ghash_bytes = ghash.to_be_bytes();
@@ -116,7 +118,7 @@ pub fn decrypt(
         expected_tag[i] = e0[i] ^ ghash_bytes[i];
     }
     if expected_tag.ct_eq(tag).unwrap_u8() != 1 {
-        return Err(DecryptErr);
+        return Err(CryptErr);
     }
     let mut plaintext = Vec::with_capacity(ciphertext.len());
     let mut y_be = y0_be;
@@ -285,7 +287,7 @@ mod tests {
         let aad: [u8; 0] = [];
         let plaintext: [u8; 0] = [];
         let nonce: [u8; 12] = [0; 12];
-        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce);
+        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce).unwrap();
         assert_eq!(ciphertext, &[], "comparing ciphertext");
         assert_eq!(
             u128::from_be_bytes(tag),
@@ -306,7 +308,7 @@ mod tests {
         let forged_tag = 0x48e2fccefa7e3061367f1d57a4e7455a_u128.to_be_bytes();
         assert_eq!(
             decrypt(&aad, &ciphertext, &forged_tag, &key, &nonce),
-            Err(DecryptErr)
+            Err(CryptErr)
         );
     }
 
@@ -316,7 +318,7 @@ mod tests {
         let aad: [u8; 0] = [];
         let plaintext: [u8; 16] = 0_u128.to_be_bytes();
         let nonce: [u8; 12] = [0; 12];
-        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce);
+        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce).unwrap();
         assert_eq!(
             u128::from_be_bytes(ciphertext.try_into().unwrap()),
             0x0388dace60b6a392f328c2b971b2fe78,
@@ -341,7 +343,7 @@ mod tests {
         let forged_tag = 0xab6e47d42cec13bdf53a67b21257bdde_u128.to_be_bytes();
         assert_eq!(
             decrypt(&aad, &ciphertext, &forged_tag, &key, &nonce),
-            Err(DecryptErr)
+            Err(CryptErr)
         );
     }
 
@@ -351,7 +353,7 @@ mod tests {
         let aad: [u8; 0] = [];
         let nonce = hex::decode("cafebabefacedbaddecaf888").unwrap();
         let plaintext = hex::decode("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255").unwrap();
-        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce);
+        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce).unwrap();
         assert_eq!(ciphertext, hex::decode(&"42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f5985").unwrap(), "comparing ciphertext");
         assert_eq!(
             u128::from_be_bytes(tag),
@@ -373,7 +375,7 @@ mod tests {
         let forged_tag = 0x5d5c2af327cd64a62cf35abd2ba6fab4_u128.to_be_bytes();
         assert_eq!(
             decrypt(&aad, &ciphertext, &forged_tag, &key, &nonce),
-            Err(DecryptErr)
+            Err(CryptErr)
         );
     }
 
@@ -383,7 +385,7 @@ mod tests {
         let aad = hex::decode("feedfacedeadbeeffeedfacedeadbeefabaddad2").unwrap();
         let plaintext = hex::decode("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39").unwrap();
         let nonce = hex::decode("cafebabefacedbaddecaf888").unwrap();
-        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce);
+        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce).unwrap();
         assert_eq!(ciphertext, hex::decode(&"42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091").unwrap(), "comparing ciphertext");
         assert_eq!(
             u128::from_be_bytes(tag),
@@ -398,7 +400,7 @@ mod tests {
         let aad = hex::decode("feedfacedeadbeeffeedfacedeadbeefabaddad2").unwrap();
         let plaintext = hex::decode("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39").unwrap();
         let nonce = hex::decode("cafebabefacedbad").unwrap();
-        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce);
+        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce).unwrap();
         assert_eq!(ciphertext, hex::decode(&"61353b4c2806934a777ff51fa22a4755699b2a714fcdc6f83766e5f97b6c742373806900e49f24b22b097544d4896b424989b5e1ebac0f07c23f4598").unwrap(), "comparing ciphertext");
         assert_eq!(
             u128::from_be_bytes(tag),
@@ -413,7 +415,7 @@ mod tests {
         let aad = hex::decode("feedfacedeadbeeffeedfacedeadbeefabaddad2").unwrap();
         let plaintext = hex::decode("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39").unwrap();
         let nonce = hex::decode("9313225df88406e555909c5aff5269aa6a7a9538534f7da1e4c303d2a318a728c3c0c95156809539fcf0e2429a6b525416aedbf5a0de6a57a637b39b").unwrap();
-        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce);
+        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce).unwrap();
         assert_eq!(ciphertext, hex::decode(&"8ce24998625615b603a033aca13fb894be9112a5c3a211a8ba262a3cca7e2ca701e4a9a4fba43c90ccdcb281d48c7c6fd62875d2aca417034c34aee5").unwrap(), "comparing ciphertext");
         assert_eq!(
             u128::from_be_bytes(tag),
@@ -428,7 +430,7 @@ mod tests {
         let aad = "0011223344556677".as_bytes();
         let plaintext = "I will become what I deserve, Is there anything like freewil?".as_bytes();
         let nonce = "abcdef012345".as_bytes();
-        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce);
+        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce).unwrap();
         assert_eq!(ciphertext, hex::decode(&"03feb633afbc123a3ab9f1119694c4becdf1bdc5c1fc584f128d893f1bf08862e1a2e29e821d9c8b59dc1942c1033724e3a1128c9586104c88bf720449").unwrap(), "comparing ciphertext");
         assert_eq!(
             &tag[..],
