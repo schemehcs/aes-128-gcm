@@ -198,6 +198,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn encrypt_err() {
+        assert_eq!(Err(CryptErr), encrypt(&[], &[], &[0; 16], &[]));
+    }
+
+    #[test]
+    fn crypt_err() {
+        let crypt_err = CryptErr;
+        assert_eq!(crypt_err.to_string(), "Failed to crypt");
+    }
+
+    #[test]
     fn gmul_case1() {
         assert_eq!(
             gmul(
@@ -417,11 +428,16 @@ mod tests {
         let nonce = hex::decode("9313225df88406e555909c5aff5269aa6a7a9538534f7da1e4c303d2a318a728c3c0c95156809539fcf0e2429a6b525416aedbf5a0de6a57a637b39b").unwrap();
         let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce).unwrap();
         assert_eq!(ciphertext, hex::decode(&"8ce24998625615b603a033aca13fb894be9112a5c3a211a8ba262a3cca7e2ca701e4a9a4fba43c90ccdcb281d48c7c6fd62875d2aca417034c34aee5").unwrap(), "comparing ciphertext");
+
         assert_eq!(
             u128::from_be_bytes(tag),
             0x619cc5aefffe0bfa462af43c1699d050,
             "comparing tag"
         );
+
+        let decrypted = decrypt(&aad, &ciphertext, &tag, &key, &nonce).unwrap();
+
+        assert_eq!(decrypted, plaintext);
     }
 
     #[test]
