@@ -1,34 +1,52 @@
 use aes_128::{AES128, Key};
+use subtle::ConstantTimeEq;
 
 pub fn encrypt(aad: &[u8], plaintext: &[u8], key: &Key, nonce: &[u8]) -> (Vec<u8>, [u8; 16]) {
-    let mut ciphertext = Vec::new();
-    let mut tag = [0u8; 16];
+    let mut ciphertext = Vec::with_capacity(plaintext.len());
     let ciph = AES128::new(key);
     let h = u128::from_be_bytes(ciph.encrypt(&[0; 16]));
-    let y0: u128 = if nonce.len() == 12 {
-        let mut y_bytes = [0u8; 16];
-        y_bytes[..12].copy_from_slice(nonce);
-        y_bytes[15] = 1;
-        u128::from_be_bytes(y_bytes)
+    let y0_be = if nonce.len() == 12 {
+        let mut t = [0u8; 16];
+        t[..12].copy_from_slice(nonce);
+        t[15] = 1;
+        t
     } else {
-        ghash_a_c(h, &[], nonce)
+        ghash_streaming(h, &[], nonce).to_be_bytes()
     };
-    let mut y = incr(y0);
-    for chunk in plaintext.chunks(16) {
-        let stream = ciph.encrypt(&y.to_be_bytes());
-        for i in 0..chunk.len() {
-            ciphertext.push(stream[i] ^ chunk[i]);
-        }
-        y = incr(y);
+    let mut y_be = y0_be;
+    incr_be(&mut y_be);
+    let mut chunks = plaintext.chunks_exact(16);
+    for chunk_n in chunks
+        .by_ref()
+        .map(|c| u128::from_be_bytes(c.try_into().unwrap()))
+    {
+        let stream = ciph.encrypt(&y_be);
+        let stream_n = u128::from_be_bytes(stream);
+        let cipher = stream_n ^ chunk_n;
+        ciphertext.extend_from_slice(&cipher.to_be_bytes());
+        incr_be(&mut y_be);
     }
-    let tag_ghash = ghash_a_c(h, aad, &ciphertext);
-    let tag_bytes = tag_ghash.to_be_bytes();
-    let e0 = ciph.encrypt(&y0.to_be_bytes());
-    for i in 0..16 {
-        tag[i] = tag_bytes[i] ^ e0[i];
+    let remainder = chunks.remainder();
+    if !remainder.is_empty() {
+        let stream = ciph.encrypt(&y_be);
+        let stream_n = u128::from_be_bytes(stream);
+        let mut block: [u8; 16] = [0; 16];
+        block[..remainder.len()].copy_from_slice(remainder);
+        let block_n = u128::from_be_bytes(block);
+        let cipher = stream_n ^ block_n;
+        ciphertext.extend_from_slice(&cipher.to_be_bytes()[..remainder.len()]);
     }
+    let tag_ghash = ghash_streaming(h, aad, &ciphertext);
+    let e0 = ciph.encrypt(&y0_be);
+    let e0_n = u128::from_be_bytes(e0);
+    let tag_n = tag_ghash ^ e0_n;
+    (ciphertext, tag_n.to_be_bytes())
+}
 
-    (ciphertext, tag)
+fn incr_be(y: &mut [u8; 16]) {
+    let mut ctr: u32 = u32::from_be_bytes(y[12..].try_into().unwrap());
+    ctr = ctr.wrapping_add(1);
+    y[12..].copy_from_slice(&ctr.to_be_bytes());
 }
 
 #[derive(Debug, PartialEq)]
@@ -50,103 +68,95 @@ pub fn decrypt(
 ) -> Result<Vec<u8>, DecryptErr> {
     let ciph = AES128::new(key);
     let h = u128::from_be_bytes(ciph.encrypt(&[0; 16]));
-    let y0: u128 = if nonce.len() == 12 {
-        let mut y_bytes = [0u8; 16];
-        y_bytes[..12].copy_from_slice(nonce);
-        y_bytes[15] = 1;
-        u128::from_be_bytes(y_bytes)
+    let y0_be = if nonce.len() == 12 {
+        let mut t = [0u8; 16];
+        t[..12].copy_from_slice(nonce);
+        t[15] = 1;
+        t
     } else {
-        ghash_a_c(h, &[], nonce)
+        ghash_streaming(h, &[], nonce).to_be_bytes()
     };
-    let e0 = ciph.encrypt(&y0.to_be_bytes());
-    let ghash = ghash_a_c(h, aad, ciphertext);
+    let e0 = ciph.encrypt(&y0_be);
+    let ghash = ghash_streaming(h, aad, ciphertext);
     let ghash_bytes = ghash.to_be_bytes();
-    let mut tag_match: bool = true;
+    let mut expected_tag = [0u8; 16];
     for i in 0..16 {
-        if tag[i] != e0[i] ^ ghash_bytes[i] {
-            tag_match = false;
-        }
+        expected_tag[i] = e0[i] ^ ghash_bytes[i];
     }
-    if !tag_match {
+    if expected_tag.ct_eq(tag).unwrap_u8() != 1 {
         return Err(DecryptErr);
     }
-
-    let mut plaintext = Vec::new();
-    let mut y = incr(y0);
-    for chunk in ciphertext.chunks(16) {
-        let stream = ciph.encrypt(&y.to_be_bytes());
-        for i in 0..chunk.len() {
-            plaintext.push(stream[i] ^ chunk[i]);
-        }
-        y = incr(y);
+    let mut plaintext = Vec::with_capacity(ciphertext.len());
+    let mut y_be = y0_be;
+    incr_be(&mut y_be);
+    let mut chunks = ciphertext.chunks_exact(16);
+    for chunk_n in chunks
+        .by_ref()
+        .map(|c| u128::from_be_bytes(c.try_into().unwrap()))
+    {
+        let stream = ciph.encrypt(&y_be);
+        let stream_n = u128::from_be_bytes(stream);
+        let cipher = chunk_n ^ stream_n;
+        plaintext.extend_from_slice(&cipher.to_be_bytes());
+        incr_be(&mut y_be);
+    }
+    let remainder = chunks.remainder();
+    if !remainder.is_empty() {
+        let stream = ciph.encrypt(&y_be);
+        let stream_n = u128::from_be_bytes(stream);
+        let mut block = [0u8; 16];
+        block[..remainder.len()].copy_from_slice(remainder);
+        let block_n = u128::from_be_bytes(block);
+        let text = block_n ^ stream_n;
+        plaintext.extend_from_slice(&text.to_be_bytes()[..remainder.len()]);
     }
     Ok(plaintext)
 }
 
-fn incr(y: u128) -> u128 {
-    const CTR_MASK: u128 = 0xFFFFFFFF;
-    if y & CTR_MASK != CTR_MASK {
-        y + 1
-    } else {
-        y & !CTR_MASK
-    }
-}
-
-/// calculate the ghash of bytes
-///
-/// Blocks are chunked by 16b each, the last block is padded with 0s if 1<=len(last)<16
-fn ghash_raw(h: u128, xs: &[u8]) -> u128 {
-    let mut y = 0;
-    let mut chunks = xs.chunks_exact(16);
+fn ghash_streaming(h: u128, aad: &[u8], ciphertext: &[u8]) -> u128 {
+    let mut y = 0u128;
+    let mut chunks = aad.chunks_exact(16);
     for xc in chunks.by_ref() {
-        let x: u128 = u128::from_be_bytes(xc.try_into().unwrap());
+        let x = u128::from_be_bytes(xc.try_into().unwrap());
         y = gmul(y ^ x, h);
     }
-    let remainder = chunks.remainder();
-    if !remainder.is_empty() {
+    let rem = chunks.remainder();
+    if !rem.is_empty() {
         let mut last_block = [0_u8; 16];
-        last_block[..remainder.len()].copy_from_slice(remainder);
-        let ln = u128::from_be_bytes(last_block);
-        y = gmul(y ^ ln, h);
+        last_block[..rem.len()].copy_from_slice(rem);
+        y = gmul(y ^ u128::from_be_bytes(last_block), h);
     }
-    y
+    let mut chunks = ciphertext.chunks_exact(16);
+    for xc in chunks.by_ref() {
+        let x = u128::from_be_bytes(xc.try_into().unwrap());
+        y = gmul(y ^ x, h);
+    }
+    let rem = chunks.remainder();
+    if !rem.is_empty() {
+        let mut last_block = [0_u8; 16];
+        last_block[..rem.len()].copy_from_slice(rem);
+        y = gmul(y ^ u128::from_be_bytes(last_block), h);
+    }
+    let len_a = (aad.len() as u64).wrapping_mul(8);
+    let len_c = (ciphertext.len() as u64).wrapping_mul(8);
+    let mut len_block = [0u8; 16];
+    len_block[..8].copy_from_slice(&len_a.to_be_bytes());
+    len_block[8..].copy_from_slice(&len_c.to_be_bytes());
+    gmul(y ^ u128::from_be_bytes(len_block), h)
 }
 
-/// calculate the ghash for associated data and ciphered bytes
-///
-/// align with aes gcm GHASH specification
-fn ghash_a_c(h: u128, a: &[u8], c: &[u8]) -> u128 {
-    let mut hash_input: Vec<u8> = Vec::new();
-    hash_input.extend_from_slice(a);
-    let a_pad = a.len() % 16;
-    if a_pad != 0 {
-        hash_input.extend(std::iter::repeat_n(0, 16 - a_pad));
-    }
-    hash_input.extend_from_slice(c);
-    let c_pad = c.len() % 16;
-    if c_pad != 0 {
-        hash_input.extend(std::iter::repeat_n(0, 16 - c_pad));
-    }
-    let len_a = a.len() * 8;
-    hash_input.extend_from_slice(&len_a.to_be_bytes());
-
-    let len_c = c.len() * 8;
-    hash_input.extend_from_slice(&len_c.to_be_bytes());
-    ghash_raw(h, &hash_input)
-}
-
+#[inline]
 fn gmul(mut x: u128, mut y: u128) -> u128 {
     const REM: u128 = 0xE1 << 120;
-    const MSB: u128 = 1 << 127;
-    let mut p = 0;
+    let mut z = 0u128;
     for _ in 0..128 {
-        if y & MSB == MSB {
-            p ^= x;
-        }
+        let mask_z = 0_u128.wrapping_sub(y >> 127);
+        z ^= x & mask_z;
         y <<= 1;
-        x = if x & 1 == 1 { (x >> 1) ^ REM } else { x >> 1 };
+        let mask_x = 0_u128.wrapping_sub(x & 1);
+        x = (x >> 1) ^ (REM & mask_x);
     }
-    p
+    z
 }
 
 #[cfg(test)]
@@ -230,7 +240,10 @@ mod tests {
         let h = 0x66e94bd4ef8a2c3b884cfa59ca342b2e;
         let a = [];
         let c = 0x0388dace60b6a392f328c2b971b2fe78_u128.to_be_bytes();
-        assert_eq!(ghash_a_c(h, &a, &c), 0xf38cbb1ad69223dcc3457ae5b6b0f885);
+        assert_eq!(
+            ghash_streaming(h, &a, &c),
+            0xf38cbb1ad69223dcc3457ae5b6b0f885
+        );
     }
 
     /* ref: https://luca-giuzzi.unibs.it/corsi/Support/papers-cryptography/gcm-spec.pdf */
@@ -373,6 +386,21 @@ mod tests {
         assert_eq!(
             u128::from_be_bytes(tag),
             0x619cc5aefffe0bfa462af43c1699d050,
+            "comparing tag"
+        );
+    }
+
+    #[test]
+    fn gcm_case7() {
+        let key: [u8; 16] = "0123456789123456".as_bytes().try_into().unwrap();
+        let aad = "0011223344556677".as_bytes();
+        let plaintext = "I will become what I deserve, Is there anything like freewil?".as_bytes();
+        let nonce = "abcdef012345".as_bytes();
+        let (ciphertext, tag) = encrypt(&aad, &plaintext, &key, &nonce);
+        assert_eq!(ciphertext, hex::decode(&"03feb633afbc123a3ab9f1119694c4becdf1bdc5c1fc584f128d893f1bf08862e1a2e29e821d9c8b59dc1942c1033724e3a1128c9586104c88bf720449").unwrap(), "comparing ciphertext");
+        assert_eq!(
+            &tag[..],
+            &hex::decode("d067e05d1155ab4c9f30c5eb194d9f67").unwrap(),
             "comparing tag"
         );
     }
